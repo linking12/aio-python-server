@@ -1,0 +1,6 @@
+# Optional extra for the /v1/browser/* endpoints.
+# browser_sdk drives a Chrome over CDP via Playwright (connect_over_cdp),
+# so only the Playwright *python package* is needed — NOT its bundled browsers.
+# Point the server at any local Chrome started with:
+#   --remote-debugging-port=9222 --remote-allow-origins=*
+playwright>=1.40

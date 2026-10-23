@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aio-python-server"
+version = "0.1.0"
+description = "Standalone extraction of the AIO Sandbox python-server (unified sandbox control-plane API)"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[project.scripts]
+aio-python-server = "app.cli:cli"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["app*", "vendors*", "browser_sdk*"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }

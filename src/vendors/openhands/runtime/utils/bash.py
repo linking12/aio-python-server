@@ -1,0 +1,1032 @@
+import os
+import pathlib
+import re
+import shlex
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass
+from enum import Enum
+
+import bashlex
+import libtmux
+from wcwidth import wcwidth, wcswidth
+
+from vendors.openhands.core.logger import openhands_logger as logger
+from vendors.openhands.events.action import CmdRunAction
+from vendors.openhands.events.observation import ErrorObservation
+from vendors.openhands.events.observation.commands import (
+    CMD_OUTPUT_PS1_END,
+    CmdOutputMetadata,
+    CmdOutputObservation,
+)
+from vendors.openhands.runtime.utils.bash_constants import TIMEOUT_MESSAGE_TEMPLATE
+from vendors.openhands.utils.shutdown_listener import should_continue
+
+
+RUNTIME_USERNAME = os.getenv('RUNTIME_USERNAME')
+SU_TO_USER = os.getenv('SU_TO_USER', 'true').lower() in (
+    '1',
+    'true',
+    't',
+    'yes',
+    'y',
+    'on',
+)
+
+
+def split_bash_commands(commands: str) -> list[str]:
+    if not commands.strip():
+        return ['']
+    try:
+        parsed = bashlex.parse(commands)
+    except (
+        bashlex.errors.ParsingError,
+        NotImplementedError,
+        TypeError,
+        AttributeError,
+    ):
+        # Added AttributeError to catch 'str' object has no attribute 'kind' error (issue #8369)
+        logger.debug(
+            f'Failed to parse bash commands\n'
+            f'[input]: {commands}\n'
+            f'The original command will be returned as is.',
+            exc_info=True,
+        )
+        # If parsing fails, return the original commands
+        return [commands]
+
+    result: list[str] = []
+    last_end = 0
+
+    for node in parsed:
+        start, end = node.pos
+
+        # Include any text between the last command and this one
+        if start > last_end:
+            between = commands[last_end:start]
+            logger.debug(f'BASH PARSING between: {between}')
+            if result:
+                result[-1] += between.rstrip()
+            elif between.strip():
+                # THIS SHOULD NOT HAPPEN
+                result.append(between.rstrip())
+
+        # Extract the command, preserving original formatting
+        command = commands[start:end].rstrip()
+        logger.debug(f'BASH PARSING command: {command}')
+        result.append(command)
+
+        last_end = end
+
+    # Add any remaining text after the last command to the last command
+    remaining = commands[last_end:].rstrip()
+    logger.debug(f'BASH PARSING remaining: {remaining}')
+    if last_end < len(commands) and result:
+        result[-1] += remaining
+        logger.debug(f'BASH PARSING result[-1] += remaining: {result[-1]}')
+    elif last_end < len(commands):
+        if remaining:
+            result.append(remaining)
+            logger.debug(f'BASH PARSING result.append(remaining): {result[-1]}')
+    return result
+
+
+def escape_bash_special_chars(command: str) -> str:
+    r"""Returns the command as-is without modification.
+
+    Previously this function attempted to escape special characters like \;, \|, \&
+    for the difference between Python string escaping and bash escaping. However,
+    this caused a bug where already-escaped characters in user commands (e.g., \&
+    to escape an ampersand in a filename) would be double-escaped to \\&, causing
+    bash to interpret & as a background process operator instead of a literal character.
+
+    When users send commands via the API, they are expected to provide properly
+    formatted bash commands. No additional escaping is needed.
+    """
+    return command
+
+
+# Threshold (in bytes) above which commands are written to a temp file
+# instead of being sent directly via tmux send_keys.  tmux has an input
+# buffer limit (~1024-2048 bytes depending on version) that causes long
+# commands to be garbled when pasted directly.
+LONG_COMMAND_THRESHOLD = 500
+DEFAULT_TMUX_PANE_WIDTH = 10_000
+DEFAULT_TMUX_PANE_HEIGHT = 1_000
+DEFAULT_CAPTURE_PATCH_MARGIN = 8
+TMUX_PADDING_PROBE_WIDTH_DELTA = 16
+MIN_TMUX_PADDING_PROBE_WIDTH = 1_000
+
+
+class BashCommandStatus(Enum):
+    CONTINUE = 'continue'
+    COMPLETED = 'completed'
+    NO_CHANGE_TIMEOUT = 'no_change_timeout'
+    HARD_TIMEOUT = 'hard_timeout'
+
+
+def _remove_command_prefix(command_output: str, command: str) -> str:
+    return command_output.lstrip().removeprefix(command.lstrip()).lstrip()
+
+
+def _build_tmux_session_name(username: str | None) -> str:
+    """Build a tmux-safe session name.
+
+    tmux session names cannot contain periods or colons, so sanitize the
+    username portion before constructing the internal session name while
+    keeping the original separators distinguishable in logs.
+    """
+    username_part = username or 'user'
+    username_part = username_part.replace(':', '__').replace('.', '_')
+    return f'openhands-{username_part}-{uuid.uuid4()}'
+
+
+_ANSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+
+
+def _strip_ansi_codes(text: str) -> str:
+    return _ANSI_RE.sub('', text)
+
+
+def _char_display_width(char: str) -> int:
+    if not char:
+        return 0
+    return max(wcwidth(char), 0)
+
+
+def _display_width(text: str) -> int:
+    return max(wcswidth(_strip_ansi_codes(text)), 0)
+
+
+def _first_display_char_width(text: str) -> int:
+    for char in _strip_ansi_codes(text):
+        width = _char_display_width(char)
+        if width > 0:
+            return width
+    return 0
+
+
+def _may_have_soft_wrap_issue(
+    j_text: str, pane_width: int, margin: int = DEFAULT_CAPTURE_PATCH_MARGIN
+) -> bool:
+    threshold = max(1, pane_width - margin)
+    return any(_display_width(line) >= threshold for line in j_text.splitlines())
+
+
+def _is_high_confidence_padding_boundary(
+    prev: str, next_line: str, spaces: str, pane_width: int, margin: int
+) -> bool:
+    if not spaces or not set(spaces) <= {' '}:
+        return False
+    # Do not delete leading spaces that come from the next screen line itself.
+    if next_line.startswith(' '):
+        return False
+
+    prev_width = _display_width(prev)
+    remaining = pane_width - prev_width
+    if remaining <= 0 or remaining > margin:
+        return False
+    if len(spaces) != remaining:
+        return False
+
+    next_char_width = _first_display_char_width(next_line)
+    return next_char_width > remaining
+
+
+@dataclass(frozen=True)
+class _TmuxPaddingCandidate:
+    start: int
+    end: int
+    prev: str
+    next_line: str
+    spaces: str
+
+
+def _find_tmux_join_padding_candidates(
+    j_text: str,
+    non_j_text: str,
+    pane_width: int,
+    margin: int = DEFAULT_CAPTURE_PATCH_MARGIN,
+) -> list[_TmuxPaddingCandidate]:
+    """Find possible tmux -J padding spaces at wrapped screen-row boundaries."""
+    raw_non_j_lines = non_j_text.splitlines()
+    non_j_lines = [line.rstrip() for line in raw_non_j_lines]
+    candidates: list[_TmuxPaddingCandidate] = []
+    cursor = 0
+
+    for raw_prev, prev, next_line in zip(
+        raw_non_j_lines, non_j_lines, non_j_lines[1:]
+    ):
+        if not prev or not next_line:
+            continue
+        # If the non-J screen row already ends with a space, that space may be
+        # real command output placed at the wrap boundary. Keep the J capture as
+        # is because tmux screen capture cannot distinguish this from padding
+        # safely.
+        if raw_prev.endswith(' '):
+            continue
+
+        prev_index = j_text.find(prev, cursor)
+        if prev_index < 0:
+            continue
+
+        boundary_start = prev_index + len(prev)
+        if boundary_start >= len(j_text):
+            cursor = boundary_start
+            continue
+
+        if j_text.startswith('\n', boundary_start):
+            cursor = boundary_start
+            continue
+
+        if j_text.startswith(next_line, boundary_start):
+            cursor = boundary_start
+            continue
+
+        match = re.match(r' +', j_text[boundary_start:])
+        if not match:
+            cursor = boundary_start
+            continue
+
+        spaces = match.group(0)
+        next_start = boundary_start + len(spaces)
+        if not j_text.startswith(next_line, next_start):
+            cursor = boundary_start
+            continue
+
+        if _is_high_confidence_padding_boundary(
+            prev, next_line, spaces, pane_width, margin
+        ):
+            logger.debug(
+                'Detected tmux -J padding boundary: '
+                f'prev_width={_display_width(prev)}, '
+                f'padding_spaces={len(spaces)}, '
+                f'next_first_width={_first_display_char_width(next_line)}, '
+                f'pane_width={pane_width}'
+            )
+            candidates.append(
+                _TmuxPaddingCandidate(
+                    start=boundary_start,
+                    end=next_start,
+                    prev=prev,
+                    next_line=next_line,
+                    spaces=spaces,
+                )
+            )
+
+        # Keep the cursor at the beginning of the next screen row content so
+        # the following boundary can be evaluated as an overlapping pair:
+        # (line N, line N+1), then (line N+1, line N+2).
+        cursor = next_start
+
+    return candidates
+
+
+def _apply_tmux_padding_removals(
+    j_text: str, candidates: list[_TmuxPaddingCandidate]
+) -> str:
+    if not candidates:
+        return j_text
+
+    patched = j_text
+    for candidate in reversed(candidates):
+        patched = patched[: candidate.start] + patched[candidate.end :]
+    logger.debug(f'Removed {len(candidates)} tmux -J padding boundary segment(s)')
+    return patched
+
+
+def _patch_tmux_join_padding_spaces(
+    j_text: str,
+    non_j_text: str,
+    pane_width: int,
+    margin: int = DEFAULT_CAPTURE_PATCH_MARGIN,
+) -> str:
+    """Remove high-confidence tmux -J padding spaces at wrapped boundaries.
+
+    The returned text keeps `j_text` as the source of truth and only removes
+    spaces that are proven by non-J capture to sit between two adjacent screen
+    rows, and by display-width checks to be screen padding left before a wide
+    character.
+    """
+    candidates = _find_tmux_join_padding_candidates(
+        j_text, non_j_text, pane_width, margin
+    )
+    return _apply_tmux_padding_removals(j_text, candidates)
+
+
+class BashSession:
+    # Adaptive polling strategy:
+    # - Quick commands (ls, pwd, cat): complete within ~100ms, need fast detection
+    # - Long commands (npm install, make): need no_change_timeout detection
+    POLL_INTERVAL_FAST = 0.05  # 50ms - used during initial phase
+    POLL_INTERVAL_SLOW = 0.5  # 500ms - used after initial phase (for no_change_timeout)
+    POLL_FAST_PHASE_SECONDS = 0.5  # First 500ms use fast polling, then switch to slow
+    HISTORY_LIMIT = 10_000
+
+    def __init__(
+        self,
+        work_dir: str,
+        username: str | None = None,
+        no_change_timeout_seconds: int = 30,
+        max_memory_mb: int | None = None,
+        preserve_symlinks: bool = False,
+    ):
+        self.NO_CHANGE_TIMEOUT_SECONDS = no_change_timeout_seconds
+        self.work_dir = work_dir
+        self.username = username
+        self._initialized = False
+        self.max_memory_mb = max_memory_mb
+        self.preserve_symlinks = preserve_symlinks
+        # PS1 now includes both working_dir (resolved) and working_dir_symlink (raw $PWD)
+        # The caller can choose which one to use based on preserve_symlinks at runtime
+        self.PS1 = CmdOutputMetadata.to_ps1_prompt()
+
+    def initialize(self) -> None:
+        try:
+            # Support custom tmux socket path via environment variable
+            # This is the standard way to handle container permission issues
+            tmux_tmpdir = os.environ.get('TMUX_TMPDIR')
+            if tmux_tmpdir:
+                tmux_tmpdir_path = pathlib.Path(tmux_tmpdir)
+                socket_path = str(tmux_tmpdir_path / f'tmux-{os.geteuid()}' / 'default')
+                logger.info(
+                    f'Using custom tmux socket directory: {tmux_tmpdir}, socket_path: {socket_path}'
+                )
+                self.server = libtmux.Server(socket_path=socket_path)
+            else:
+                self.server = libtmux.Server()
+
+        except Exception as e:
+            # Provide helpful error message for container environments
+            error_msg = (
+                f'Failed to create tmux server: {e}. '
+                'This commonly occurs in restricted container environments. '
+                'To fix: (1) Ensure /tmp is writable, or (2) Set TMUX_TMPDIR environment variable '
+                'to a writable directory, or (3) Mount /tmp with proper permissions in your container.'
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg) from e
+
+        _shell_command = '/bin/bash'
+        if SU_TO_USER and self.username in list(
+            filter(None, [RUNTIME_USERNAME, 'root', 'openhands'])
+        ):
+            # This starts a non-login (new) shell for the given user
+            _shell_command = f'su {self.username} -'
+
+        # FIXME: we will introduce memory limit using sysbox-runc in coming PR
+        # # otherwise, we are running as the CURRENT USER (e.g., when running LocalRuntime)
+        # if self.max_memory_mb is not None:
+        #     window_command = (
+        #         f'prlimit --as={self.max_memory_mb * 1024 * 1024} {_shell_command}'
+        #     )
+        # else:
+        window_command = _shell_command
+
+        logger.debug(
+            f'Initializing bash session in {self.work_dir} with command: {window_command}'
+        )
+        session_name = _build_tmux_session_name(self.username)
+        self.session = self.server.new_session(
+            session_name=session_name,
+            start_directory=self.work_dir,  # This parameter is supported by libtmux
+            kill_session=True,
+            x=DEFAULT_TMUX_PANE_WIDTH,
+            y=DEFAULT_TMUX_PANE_HEIGHT,
+        )
+
+        # Set history limit to a large number to avoid losing history
+        # https://unix.stackexchange.com/questions/43414/unlimited-history-in-tmux
+        self.session.set_option('history-limit', str(self.HISTORY_LIMIT), global_=True)
+        self.session.history_limit = self.HISTORY_LIMIT
+        # We need to create a new pane because the initial pane's history limit is (default) 2000
+        _initial_window = self.session.active_window
+        self.window = self.session.new_window(
+            window_name='bash',
+            window_shell=window_command,
+            start_directory=self.work_dir,  # This parameter is supported by libtmux
+        )
+        self.pane = self.window.active_pane
+        logger.debug(f'pane: {self.pane}; history_limit: {self.session.history_limit}')
+        _initial_window.kill()
+
+        # Configure bash to use simple PS1 and disable PS2
+        self.pane.send_keys(
+            f'export PROMPT_COMMAND=\'export PS1="{self.PS1}"\'; export PS2=""'
+        )
+        time.sleep(0.1)  # Wait for command to take effect
+
+        # If preserve_symlinks is enabled, we need to cd to the original work_dir
+        # to set $PWD correctly (tmux's start_directory resolves symlinks internally)
+        if self.preserve_symlinks:
+            self.pane.send_keys(f'cd {shlex.quote(self.work_dir)}')
+            time.sleep(0.1)  # Wait for cd to take effect
+
+        self._clear_screen()
+
+        # Store the last command for interactive input handling
+        self.prev_status: BashCommandStatus | None = None
+        self.prev_output: str = ''
+        self._closed: bool = False
+        logger.debug(f'Bash session initialized with work dir: {self.work_dir}')
+
+        # Maintain the current working directory
+        # When preserve_symlinks is True, keep the original path; otherwise resolve it
+        if self.preserve_symlinks:
+            self._cwd = self.work_dir
+        else:
+            self._cwd = os.path.realpath(self.work_dir)
+        self._temp_command_files: set[str] = set()
+        self._initialized = True
+
+    def __del__(self) -> None:
+        """Ensure the session is closed when the object is destroyed."""
+        self.close()
+
+    def _get_pane_content(self, verify_padding: bool = False) -> str:
+        """Capture the current pane content and update the buffer."""
+        j_content = self._capture_pane_content(join_wrapped_lines=True)
+
+        if not verify_padding:
+            return j_content
+
+        pane_width, pane_height = self._get_current_pane_size()
+        margin = DEFAULT_CAPTURE_PATCH_MARGIN
+        if not _may_have_soft_wrap_issue(j_content, pane_width, margin):
+            return j_content
+
+        non_j_content = self._capture_pane_content(
+            join_wrapped_lines=False, preserve_trailing_spaces=True
+        )
+        candidates = _find_tmux_join_padding_candidates(
+            j_content, non_j_content, pane_width, margin
+        )
+        if not candidates:
+            return j_content
+
+        confirmed_candidates = self._confirm_tmux_padding_candidates_by_resize(
+            candidates, pane_width, pane_height
+        )
+        return _apply_tmux_padding_removals(j_content, confirmed_candidates)
+
+    def _get_current_pane_size(self) -> tuple[int, int]:
+        try:
+            output = self.pane.cmd(
+                'display-message', '-p', '#{pane_width} #{pane_height}'
+            ).stdout[0]
+            width, height = output.strip().split()
+            return int(width), int(height)
+        except Exception:
+            logger.warning(
+                'Failed to get current tmux pane size; using default size.',
+                exc_info=True,
+            )
+            return DEFAULT_TMUX_PANE_WIDTH, DEFAULT_TMUX_PANE_HEIGHT
+
+    def _confirm_tmux_padding_candidates_by_resize(
+        self,
+        candidates: list[_TmuxPaddingCandidate],
+        pane_width: int,
+        pane_height: int,
+    ) -> list[_TmuxPaddingCandidate]:
+        probe_width = pane_width - TMUX_PADDING_PROBE_WIDTH_DELTA
+        if probe_width < MIN_TMUX_PADDING_PROBE_WIDTH:
+            logger.debug(
+                'Skip tmux padding resize verification because probe width is too small: '
+                f'pane_width={pane_width}, probe_width={probe_width}, '
+                f'min_probe_width={MIN_TMUX_PADDING_PROBE_WIDTH}'
+            )
+            return []
+
+        restore_failed = False
+        try:
+            self.window.resize(width=probe_width, height=pane_height)
+            probe_j_content = self._capture_pane_content(join_wrapped_lines=True)
+        except Exception:
+            logger.warning(
+                'Failed to resize tmux window for padding verification; '
+                'keeping original J capture.',
+                exc_info=True,
+            )
+            return []
+        finally:
+            try:
+                self.window.resize(width=pane_width, height=pane_height)
+            except Exception:
+                restore_failed = True
+                logger.warning(
+                    f'Failed to restore tmux window size to {pane_width}x{pane_height}.',
+                    exc_info=True,
+                )
+
+        if restore_failed:
+            return []
+
+        confirmed: list[_TmuxPaddingCandidate] = []
+        for candidate in candidates:
+            with_space = candidate.prev + candidate.spaces + candidate.next_line
+            without_space = candidate.prev + candidate.next_line
+            if without_space in probe_j_content and with_space not in probe_j_content:
+                confirmed.append(candidate)
+            elif with_space in probe_j_content:
+                logger.debug('Preserved candidate space after resize verification')
+            else:
+                logger.debug(
+                    'Could not verify tmux padding candidate after resize; '
+                    'preserving original J capture segment'
+                )
+        return confirmed
+
+    def _capture_pane_content(
+        self, join_wrapped_lines: bool, preserve_trailing_spaces: bool = False
+    ) -> str:
+        args = ['capture-pane']
+        if join_wrapped_lines:
+            args.append('-J')
+        args.extend(['-pS', '-'])
+        if preserve_trailing_spaces:
+            return '\n'.join(
+                # Do not strip Python-side trailing spaces if tmux returns any.
+                # This deliberately does not pass tmux -N: -N also preserves
+                # screen padding cells and makes real boundary spaces
+                # indistinguishable from tmux padding.
+                line.rstrip('\r\n')
+                for line in self.pane.cmd(*args).stdout
+            )
+        return '\n'.join(
+            # avoid double newlines
+            line.rstrip() for line in self.pane.cmd(*args).stdout
+        )
+
+    def close(self) -> None:
+        """Clean up the session."""
+        if not hasattr(self, '_closed') or self._closed:
+            return
+        # Clean up any leftover temp command files (from long command execution)
+        self._cleanup_temp_command_files()
+        if hasattr(self, 'session') and self.session:
+            self.session.kill()
+        self._closed = True
+
+    def _cleanup_temp_command_files(self) -> None:
+        """Remove any leftover temp command files created by this session.
+
+        These files are normally cleaned up after execution by the shell, but can be
+        left behind if the process is killed or the session crashes.
+        """
+        for f in list(self._temp_command_files):
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except OSError:
+                pass
+            self._temp_command_files.discard(f)
+
+    @property
+    def cwd(self) -> str:
+        return self._cwd
+
+    def _is_special_key(self, command: str) -> bool:
+        """Check if the command is a special key."""
+        # Special keys are of the form C-<key>
+        _command = command.strip()
+        return _command.startswith('C-') and len(_command) == 3
+
+    def _send_long_command_via_file(self, command: str) -> str:
+        """Write a long command to a temp file and return a wrapper command
+        that sources it, then removes the temp file.
+
+        This avoids tmux send_keys buffer limits that corrupt long commands
+        (especially those containing multi-byte characters or complex quoting).
+
+        Uses `source` (dot-sourcing) instead of `bash` so that cd, export,
+        aliases, and other shell state changes persist in the current session.
+        """
+        fd, tmp_path = tempfile.mkstemp(suffix='.sh', prefix='_aio_cmd_', dir='/tmp')
+        self._temp_command_files.add(tmp_path)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(command)
+        except Exception:
+            os.close(fd)
+            raise
+        # source (.) runs in the current shell context, preserving cd/export/etc.
+        # Capture exit code before rm (which always returns 0), then restore it
+        # via (exit N) which sets $? without exiting the interactive shell.
+        quoted = shlex.quote(tmp_path)
+        return f'. {quoted}; _aio_rc=$?; rm -f {quoted}; (exit $_aio_rc)'
+
+    def _clear_screen(self) -> None:
+        """Clear the tmux pane screen and history."""
+        self.pane.send_keys('C-l', enter=False)
+        time.sleep(0.1)
+        self.pane.cmd('clear-history')
+
+    def _get_command_output(
+        self,
+        command: str,
+        raw_command_output: str,
+        metadata: CmdOutputMetadata,
+        continue_prefix: str = '',
+    ) -> str:
+        """Get the command output with the previous command output removed.
+
+        Args:
+            command: The command that was executed.
+            raw_command_output: The raw output from the command.
+            metadata: The metadata object to store prefix/suffix in.
+            continue_prefix: The prefix to add to the command output if it's a continuation of the previous command.
+        """
+        # remove the previous command output from the new output if any
+        if self.prev_output:
+            command_output = raw_command_output.removeprefix(self.prev_output)
+            metadata.prefix = continue_prefix
+        else:
+            command_output = raw_command_output
+        self.prev_output = raw_command_output  # update current command output anyway
+        command_output = _remove_command_prefix(command_output, command)
+        return command_output.rstrip()
+
+    def _handle_completed_command(
+        self,
+        command: str,
+        pane_content: str,
+        ps1_matches: list[re.Match],
+        hidden: bool,
+    ) -> CmdOutputObservation:
+        is_special_key = self._is_special_key(command)
+        assert len(ps1_matches) >= 1, (
+            f'Expected at least one PS1 metadata block, but got {len(ps1_matches)}.\n'
+            f'---FULL OUTPUT---\n{pane_content!r}\n---END OF OUTPUT---'
+        )
+        metadata = CmdOutputMetadata.from_ps1_match(ps1_matches[-1])
+
+        # Special case where the previous command output is truncated due to history limit
+        # We should get the content BEFORE the last PS1 prompt
+        get_content_before_last_match = bool(len(ps1_matches) == 1)
+
+        # Update the current working directory if it has changed
+        # Use working_dir_symlink if preserve_symlinks is True, otherwise use working_dir
+        effective_working_dir = (
+            metadata.working_dir_symlink if self.preserve_symlinks else metadata.working_dir
+        )
+        if effective_working_dir and effective_working_dir != self._cwd:
+            logger.debug(
+                f'directory_changed: {self._cwd}; {effective_working_dir}; {command}'
+            )
+            self._cwd = effective_working_dir
+
+        logger.debug(f'COMMAND OUTPUT: {pane_content}')
+        # Extract the command output between the two PS1 prompts
+        raw_command_output = self._combine_outputs_between_matches(
+            pane_content,
+            ps1_matches,
+            get_content_before_last_match=get_content_before_last_match,
+        )
+
+        if get_content_before_last_match:
+            # Count the number of lines in the truncated output
+            num_lines = len(raw_command_output.splitlines())
+            metadata.prefix = f'[Previous command outputs are truncated. Showing the last {num_lines} lines of the output below.]\n'
+
+        metadata.suffix = (
+            f'\n[The command completed with exit code {metadata.exit_code}.]'
+            if not is_special_key
+            else f'\n[The command completed with exit code {metadata.exit_code}. CTRL+{command[-1].upper()} was sent.]'
+        )
+        command_output = self._get_command_output(
+            command,
+            raw_command_output,
+            metadata,
+        )
+        self.prev_status = BashCommandStatus.COMPLETED
+        self.prev_output = ''  # Reset previous command output
+        self._ready_for_next_command()
+        return CmdOutputObservation(
+            content=command_output,
+            command=command,
+            metadata=metadata,
+            hidden=hidden,
+        )
+
+    def _handle_nochange_timeout_command(
+        self,
+        command: str,
+        pane_content: str,
+        ps1_matches: list[re.Match],
+    ) -> CmdOutputObservation:
+        self.prev_status = BashCommandStatus.NO_CHANGE_TIMEOUT
+        if len(ps1_matches) != 1:
+            logger.warning(
+                'Expected exactly one PS1 metadata block BEFORE the execution of a command, '
+                f'but got {len(ps1_matches)} PS1 metadata blocks:\n---\n{pane_content!r}\n---'
+            )
+        raw_command_output = self._combine_outputs_between_matches(
+            pane_content, ps1_matches
+        )
+        metadata = CmdOutputMetadata()  # No metadata available
+        metadata.suffix = (
+            f'\n[The command has no new output after {self.NO_CHANGE_TIMEOUT_SECONDS} seconds. '
+            f'{TIMEOUT_MESSAGE_TEMPLATE}]'
+        )
+        command_output = self._get_command_output(
+            command,
+            raw_command_output,
+            metadata,
+            continue_prefix='[Below is the output of the previous command.]\n',
+        )
+        return CmdOutputObservation(
+            content=command_output,
+            command=command,
+            metadata=metadata,
+        )
+
+    def _handle_hard_timeout_command(
+        self,
+        command: str,
+        pane_content: str,
+        ps1_matches: list[re.Match],
+        timeout: float,
+    ) -> CmdOutputObservation:
+        self.prev_status = BashCommandStatus.HARD_TIMEOUT
+        if len(ps1_matches) != 1:
+            logger.warning(
+                'Expected exactly one PS1 metadata block BEFORE the execution of a command, '
+                f'but got {len(ps1_matches)} PS1 metadata blocks:\n---\n{pane_content!r}\n---'
+            )
+        raw_command_output = self._combine_outputs_between_matches(
+            pane_content, ps1_matches
+        )
+        metadata = CmdOutputMetadata()  # No metadata available
+        metadata.suffix = (
+            f'\n[The command timed out after {timeout} seconds. '
+            f'{TIMEOUT_MESSAGE_TEMPLATE}]'
+        )
+        command_output = self._get_command_output(
+            command,
+            raw_command_output,
+            metadata,
+            continue_prefix='[Below is the output of the previous command.]\n',
+        )
+
+        return CmdOutputObservation(
+            command=command,
+            content=command_output,
+            metadata=metadata,
+        )
+
+    def _ready_for_next_command(self) -> None:
+        """Reset the content buffer for a new command."""
+        # Clear the current content
+        self._clear_screen()
+
+    def _combine_outputs_between_matches(
+        self,
+        pane_content: str,
+        ps1_matches: list[re.Match],
+        get_content_before_last_match: bool = False,
+    ) -> str:
+        """Combine all outputs between PS1 matches.
+
+        Args:
+            pane_content: The full pane content containing PS1 prompts and command outputs
+            ps1_matches: List of regex matches for PS1 prompts
+            get_content_before_last_match: when there's only one PS1 match, whether to get
+                the content before the last PS1 prompt (True) or after the last PS1 prompt (False)
+
+        Returns:
+            Combined string of all outputs between matches
+        """
+        if len(ps1_matches) == 1:
+            if get_content_before_last_match:
+                # The command output is the content before the last PS1 prompt
+                return pane_content[: ps1_matches[0].start()]
+            else:
+                # The command output is the content after the last PS1 prompt
+                return pane_content[ps1_matches[0].end() + 1 :]
+        elif len(ps1_matches) == 0:
+            return pane_content
+        combined_output = ''
+        for i in range(len(ps1_matches) - 1):
+            # Extract content between current and next PS1 prompt
+            output_segment = pane_content[
+                ps1_matches[i].end() + 1 : ps1_matches[i + 1].start()
+            ]
+            combined_output += output_segment + '\n'
+        # Add the content after the last PS1 prompt
+        combined_output += pane_content[ps1_matches[-1].end() + 1 :]
+        logger.debug(f'COMBINED OUTPUT: {combined_output}')
+        return combined_output
+
+    def execute(self, action: CmdRunAction) -> CmdOutputObservation | ErrorObservation:
+        """Execute a command in the bash session."""
+        if not self._initialized:
+            raise RuntimeError('Bash session is not initialized')
+
+        # Strip the command of any leading/trailing whitespace
+        logger.debug(f'RECEIVED ACTION: {action}')
+        command = action.command.strip()
+        is_input: bool = action.is_input
+
+        # If the previous command is not completed, we need to check if the command is empty
+        if self.prev_status not in {
+            BashCommandStatus.CONTINUE,
+            BashCommandStatus.NO_CHANGE_TIMEOUT,
+            BashCommandStatus.HARD_TIMEOUT,
+        }:
+            if command == '':
+                return CmdOutputObservation(
+                    content='ERROR: No previous running command to retrieve logs from.',
+                    command='',
+                    metadata=CmdOutputMetadata(),
+                )
+            if is_input:
+                return CmdOutputObservation(
+                    content='ERROR: No previous running command to interact with.',
+                    command='',
+                    metadata=CmdOutputMetadata(),
+                )
+
+        # Check if the command is a single command or multiple commands.
+        # Newline-separated commands (e.g., "export A=1\nenv") are parsed by
+        # bashlex as multiple nodes but are valid bash — join them with ';'
+        # so they execute in a single send_keys call.
+        splited_commands = split_bash_commands(command)
+        if len(splited_commands) > 1:
+            command = ' ; '.join(splited_commands)
+            logger.debug(f'Joined {len(splited_commands)} commands: {command!r}')
+
+        # Get initial state before sending command
+        initial_pane_output = self._get_pane_content()
+        initial_ps1_matches = CmdOutputMetadata.matches_ps1_metadata(
+            initial_pane_output
+        )
+        initial_ps1_count = len(initial_ps1_matches)
+        logger.debug(f'Initial PS1 count: {initial_ps1_count}')
+
+        start_time = time.time()
+        last_change_time = start_time
+        last_pane_output = (
+            initial_pane_output  # Use initial output as the starting point
+        )
+        # Track if output has changed (command has been processed by terminal)
+        # This prevents a race condition where the initial PS1 prompt ending
+        # is mistaken for command completion before the command is echoed.
+        output_changed = False
+
+        # When prev command is still running, and we are trying to send a new command
+        if (
+            self.prev_status
+            in {
+                BashCommandStatus.HARD_TIMEOUT,
+                BashCommandStatus.NO_CHANGE_TIMEOUT,
+            }
+            and not last_pane_output.rstrip().endswith(
+                CMD_OUTPUT_PS1_END.rstrip()
+            )  # prev command is not completed
+            and not is_input
+            and command != ''  # not input and not empty command
+        ):
+            _ps1_matches = CmdOutputMetadata.matches_ps1_metadata(last_pane_output)
+            # Use initial_ps1_matches if _ps1_matches is empty, otherwise use _ps1_matches
+            # This handles the case where the prompt might be scrolled off screen but existed before
+            current_matches_for_output = (
+                _ps1_matches if _ps1_matches else initial_ps1_matches
+            )
+            raw_command_output = self._combine_outputs_between_matches(
+                last_pane_output, current_matches_for_output
+            )
+            metadata = CmdOutputMetadata()  # No metadata available
+            metadata.suffix = (
+                f'\n[Your command "{command}" is NOT executed. '
+                'The previous command is still running - You CANNOT send new commands until the previous command is completed. '
+                'By setting `is_input` to `true`, you can interact with the current process: '
+                f'{TIMEOUT_MESSAGE_TEMPLATE}]'
+            )
+            logger.debug(f'PREVIOUS COMMAND OUTPUT: {raw_command_output}')
+            command_output = self._get_command_output(
+                command,
+                raw_command_output,
+                metadata,
+                continue_prefix='[Below is the output of the previous command.]\n',
+            )
+            return CmdOutputObservation(
+                command=command,
+                content=command_output,
+                metadata=metadata,
+                hidden=getattr(action, 'hidden', False),
+            )
+
+        # Send actual command/inputs to the pane
+        if command != '':
+            is_special_key = self._is_special_key(command)
+            if is_input:
+                logger.debug(f'SENDING INPUT TO RUNNING PROCESS: {command!r}')
+                self.pane.send_keys(
+                    command,
+                    enter=not is_special_key,
+                )
+            else:
+                # convert command to raw string
+                command = escape_bash_special_chars(command)
+                if len(command.encode('utf-8', errors='replace')) > LONG_COMMAND_THRESHOLD and not is_special_key:
+                    # Long commands are written to a temp file and sourced
+                    # to avoid tmux send_keys buffer limits that corrupt
+                    # the command text (especially with multi-byte chars).
+                    command = self._send_long_command_via_file(command)
+                    logger.debug(f'SENDING LONG COMMAND VIA FILE: {command!r}')
+                else:
+                    logger.debug(f'SENDING COMMAND: {command!r}')
+                self.pane.send_keys(
+                    command,
+                    enter=not is_special_key,
+                )
+
+        # Loop until the command completes or times out
+        while should_continue():
+            _start_time = time.time()
+            logger.debug(f'GETTING PANE CONTENT at {_start_time}')
+            cur_pane_output = self._get_pane_content()
+            logger.debug(
+                f'PANE CONTENT GOT after {time.time() - _start_time:.2f} seconds'
+            )
+            cur_pane_lines = cur_pane_output.split('\n')
+            if len(cur_pane_lines) <= 20:
+                logger.debug('PANE_CONTENT: {cur_pane_output}')
+            else:
+                logger.debug(f'BEGIN OF PANE CONTENT: {cur_pane_lines[:10]}')
+                logger.debug(f'END OF PANE CONTENT: {cur_pane_lines[-10:]}')
+            ps1_matches = CmdOutputMetadata.matches_ps1_metadata(cur_pane_output)
+            current_ps1_count = len(ps1_matches)
+
+            if cur_pane_output != last_pane_output:
+                last_pane_output = cur_pane_output
+                last_change_time = time.time()
+                output_changed = True
+                logger.debug(f'CONTENT UPDATED DETECTED at {last_change_time}')
+
+            # 1) Execution completed:
+            # Condition 1: A new prompt has appeared since the command started.
+            # Condition 2: The prompt count hasn't increased (potentially because the initial one scrolled off),
+            # BUT the *current* visible pane ends with a prompt, indicating completion.
+            # NOTE: Condition 2 requires output_changed to be True, to prevent false positives
+            # where the initial PS1 prompt ending is mistaken for completion before the command
+            # is echoed to the terminal (race condition).
+            if current_ps1_count > initial_ps1_count or (
+                output_changed
+                and cur_pane_output.rstrip().endswith(CMD_OUTPUT_PS1_END.rstrip())
+            ):
+                final_pane_output = self._get_pane_content(verify_padding=True)
+                final_ps1_matches = CmdOutputMetadata.matches_ps1_metadata(
+                    final_pane_output
+                )
+                return self._handle_completed_command(
+                    command,
+                    pane_content=final_pane_output,
+                    ps1_matches=final_ps1_matches,
+                    hidden=getattr(action, 'hidden', False),
+                )
+
+            # Timeout checks should only trigger if a new prompt hasn't appeared yet.
+
+            # 2) Execution timed out since there's no change in output
+            # for a while (self.NO_CHANGE_TIMEOUT_SECONDS)
+            # We ignore this if the command is *blocking*
+            time_since_last_change = time.time() - last_change_time
+            logger.debug(
+                f'CHECKING NO CHANGE TIMEOUT ({self.NO_CHANGE_TIMEOUT_SECONDS}s): elapsed {time_since_last_change}. Action blocking: {action.blocking}'
+            )
+            if (
+                not action.blocking
+                and time_since_last_change >= self.NO_CHANGE_TIMEOUT_SECONDS
+            ):
+                return self._handle_nochange_timeout_command(
+                    command,
+                    pane_content=cur_pane_output,
+                    ps1_matches=ps1_matches,
+                )
+
+            # 3) Execution timed out due to hard timeout
+            elapsed_time = time.time() - start_time
+            logger.debug(
+                f'CHECKING HARD TIMEOUT ({action.timeout}s): elapsed {elapsed_time:.2f}'
+            )
+            if action.timeout and elapsed_time >= action.timeout:
+                logger.debug('Hard timeout triggered.')
+                return self._handle_hard_timeout_command(
+                    command,
+                    pane_content=cur_pane_output,
+                    ps1_matches=ps1_matches,
+                    timeout=action.timeout,
+                )
+
+            # Adaptive polling: fast for quick commands, slow for long-running ones
+            poll_interval = (
+                self.POLL_INTERVAL_FAST
+                if elapsed_time < self.POLL_FAST_PHASE_SECONDS
+                else self.POLL_INTERVAL_SLOW
+            )
+            logger.debug(f'SLEEPING for {poll_interval} seconds for next poll')
+            time.sleep(poll_interval)
+        raise RuntimeError('Bash session was likely interrupted...')
